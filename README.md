@@ -19,10 +19,10 @@ Trail-code gives Claude Code, Cursor, Codex and other coding agents a map of you
 
 <p>
   <a href="https://github.com/trailhq/Trail-Code"><img src="https://img.shields.io/github/stars/trailhq/Trail-Code?style=for-the-badge&logo=github&logoColor=white&label=Star%20on%20GitHub&color=FFC83D" /></a>
-  <a href="https://trailhq.com/graft"><img src="https://img.shields.io/badge/website-trailhq.com/graft-E5484D?style=for-the-badge" /></a>
+  <a href="https://trailhq.com/trail-code"><img src="https://img.shields.io/badge/website-trailhq.com/trail--code-E5484D?style=for-the-badge" /></a>
   <a href="https://discord.gg/zxmKweAA29"><img src="https://img.shields.io/badge/Discord-join-5865F2?style=for-the-badge&logo=discord&logoColor=white" /></a>
   <a href="https://www.npmjs.com/package/@trailhq/trail-code"><img src="https://img.shields.io/npm/v/%40trailhq%2Ftrail-code?style=for-the-badge&logo=npm&logoColor=white&label=npm" /></a>
-  <a href="https://www.npmjs.com/package/@nanonets/graft"><img src="https://img.shields.io/npm/dm/%40nanonets%2Fgraft?style=for-the-badge&logo=npm&logoColor=white&label=downloads" /></a>
+  <a href="https://www.npmjs.com/package/@trailhq/trail-code"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Ftrailhq.github.io%2FTrail-Code%2Fbadges%2Fnpm-downloads.json&style=for-the-badge&logo=npm&logoColor=white" /></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/%40trailhq%2Ftrail-code?style=for-the-badge&logo=nodedotjs&logoColor=white" /></a>
   <img src="https://img.shields.io/badge/TypeScript-strict-3178C6?style=for-the-badge&logo=typescript&logoColor=white" />
   <img src="https://img.shields.io/badge/License-MIT-20C997?style=for-the-badge" />
@@ -80,7 +80,7 @@ npm install -g @trailhq/trail-code && trail init
 - [Quick start](#quick-start)
 - [Part 1: The graft map](#part-1-the-graft-map), your code
 - [Part 2: Learnings](#part-2-learnings), what you, your agents and your team know
-  - [Four kinds, three places](#four-kinds-three-places) · [One decision, two teammates](#one-decision-two-teammates) · [A learning is a file](#a-learning-is-a-file) · [Your agent does the saving](#your-agent-does-the-saving)
+  - [Learnings and skills, three places](#learnings-and-skills-three-places) · [One decision, two teammates](#one-decision-two-teammates) · [A learning is a file](#a-learning-is-a-file) · [Your agent does the saving](#your-agent-does-the-saving)
 - [Your team](#your-team)
 - [What stays on your machine](#what-stays-on-your-machine)
 - [Benchmark](#benchmark) · [SWE-bench Verified](#swe-bench-verified) · [Tested on popular repos](#tested-on-popular-repos)
@@ -107,7 +107,12 @@ npm install -g @trailhq/trail-code   # install the CLI, once
 trail init                      # in your repo: build the graft map, set up .trail/, wire your agents
 ```
 
+> [!TIP]
+> **`npm install -g` says EACCES?** Your Node's global folder needs sudo. Skip sudo, or every upgrade will need it too: run `mkdir -p ~/.npm-global && npm config set prefix ~/.npm-global`, add `~/.npm-global/bin` to your `PATH`, open a new terminal and install again. Trail needs Node 22.3 or newer (20.16 works too).
+
 That is the whole setup. `trail init` asks which of your coding agents to wire up, builds the graft map from your code, creates `.trail/` for the repo's learnings, and adds a statusline and hooks to Claude Code. It also reads your past Claude Code sessions in the repo, once, for what you told Claude more than once, and saves those as learnings. Your own Claude Code does that reading, in about a minute. Then work the way you always do. No daemon, no server, nothing to babysit: it is all files.
+
+On a repo whose team hasn't set up trail yet, `trail init` asks who it's for. My team, which enter picks, sets it up for you to commit once, as below. Just me keeps all of it out of git for your clone only (in `.git/info/exclude`) and your learnings in `~/.trail`, so there is nothing to commit and nothing asks you to share. Run `trail init --team` when you want your team on it.
 
 Commit the setup so your teammates get it too. The graft map itself, in `graft/`, is a local cache like `node_modules` and is added to `.gitignore`, so it stays out of the commit:
 
@@ -168,9 +173,9 @@ Your agent forgets everything when a session ends. Next week, it digs through th
 
 Trail-code keeps what your agent works out as **learnings**, saved from your conversations as you work. The next session starts from what you, your agents and your team already know. You don't have to write any of it by hand.
 
-### Four kinds, three places
+### Learnings and skills, three places
 
-Every learning has a kind (what it is) and a place (who it is for).
+Everything Trail keeps has a place (who it is for): just you, this repo, or your team.
 
 **Three places:**
 
@@ -182,16 +187,13 @@ Every learning has a kind (what it is) and a place (who it is for).
 
 Your agent picks between personal and repo: something about your own setup stays personal ("saved just for you"); something about the code goes in the repo ("added to this repo"). The team place will gather the repo learnings of every repo in your workspace, so your team sees them together.
 
-**Four kinds:**
+**What it keeps:**
 
-| Kind | Example | Personal | Repo | Team |
+| | Example | Personal | Repo | Team |
 |---|---|:---:|:---:|:---:|
-| **Decisions**: why the code is the way it is | *"Keep retries at 4. Ruled out 10: one call could block for over an hour."* | ✅ | ✅ | soon |
-| **Preferences**: how you like things done | *"Use pnpm, not npm."* Saved when you correct your agent, and found in your past sessions by `trail init`. | ✅ | ✅ | soon |
-| **Skills**: how a job is done here | *"Read rotation with page.Rotation(), never pdfcpu: it drops /Rotate."* | soon | soon | soon |
-| **Guardrails**: what must never happen | *"Never push to main."* Checked before the command runs. | soon | soon | soon |
-
-Decision or preference? Ask whether it points at specific code and goes stale when that code changes. If it does, it is a decision. If not, it is a preference.
+| **Learnings**: what your agent follows by default; you can say otherwise in the moment | *"Keep retries at 4. Ruled out 10: one call could block for over an hour."* *"Use pnpm, not npm."* Saved when you correct your agent, and found in your past sessions by `trail init`. | ✅ | ✅ | soon |
+| **Always follow**: a mark on a learning your agent won't go against, even if asked. It stops and names the learning and who added it | *"Store money in integer cents."* Saved with `trail note --always-follow`, only when you say so. | ✅ | ✅ | soon |
+| **Skills**: how a job is done here, its steps and files, with the learnings taught on it | *"Read rotation with page.Rotation(), never pdfcpu: it drops /Rotate."* | soon | soon | soon |
 
 ### One decision, two teammates
 
@@ -236,7 +238,7 @@ None of this needs a server. Learnings travel through git, like the code they ar
 
 ### A learning is a file
 
-A decision is a short markdown file in `.trail/learnings/`, reviewed in the pull request like any other change:
+A learning is a short markdown file in `.trail/learnings/`, reviewed in the pull request like any other change:
 
 ```markdown
 ---
@@ -557,6 +559,8 @@ With no TTY to prompt on (CI, a Dockerfile, a piped shell), `init` writes **noth
 | `--agents <ids...>` | wire only these, no prompt; ids: `agents`, `adal`, `cursor`, `gemini`, `grok`, `hermes`, `antigravity`, `copilot`, `kiro`, `windsurf`, `claude` |
 | `--yes`, `-y` | skip the prompt and wire every **detected** agent |
 | `--dry-run` | print the agent wiring `init` would write, then exit without writing |
+| `--just-me` | trail just for you in this repo: git sees none of it and your learnings stay in `~/.trail` |
+| `--team` | share trail with your team: commit `.trail/` and `.claude/settings.json` once |
 | `--all-agents` | write instruction files for every known agent, detected or not |
 | `--no-agents` | Claude Code wiring only; skip other agents |
 | `--list-agents` | print the known agent ids and exit |
@@ -607,7 +611,7 @@ Where a CLI agent supports user-level `hooks.json`, as Codex does, `init` also i
 
 When Claude Code is selected (it is by default), it gets more than the skill file above. From then on, any Claude Code session opened in the repo gets:
 
-- **a live statusline**: the graft map's size, how many learnings the repo has, and a `⚠ N stale` warning when the code has moved ahead of the map
+- **a live statusline**: the folder you're in, the graft map's size, how many learnings the repo has, and a `⚠ N stale` warning when the code has moved ahead of the map
 - **auto-sync**: every query brings the graph up to date first, so an answer always describes the code as it is right now, uncommitted edits included. A query refreshes only what it reads; the markdown under `graft/` is refreshed by the background rebuild at the end of a turn that touched code. Both are structural and `$0`; auto-sync never calls the LLM on its own
 - **context on tap**: each prompt pulls in the matching nodes and the learnings left on that code; editing a file surfaces what depends on it ("blast radius"); new sessions start with the repo map and how many learnings there are
 - **learnings when you ask**: say "save this as a learning" and Claude saves one; it never asks to on its own
@@ -618,7 +622,7 @@ When Claude Code is selected (it is by default), it gets more than the skill fil
   <br/><sub>edit a file → blast radius appears inline → graph auto-resyncs → confirmed in the viewer</sub>
 </p>
 
-`trail init` is idempotent and never clobbers your existing `.claude/settings.json`: it merges its blocks and leaves the rest alone. A `statusLine` that is not Trail-code's is left untouched; re-running `init` refreshes Trail-code's own helper command if it is already installed. Pass `--no-statusline` (or `GRAFT_NO_STATUSLINE=1`) to skip installing one at all, since a project-level `statusLine` would otherwise hide a custom one in `~/.claude/settings.json`. Want the LLM summaries too? Run `trail build --deep` (with a key) whenever you like; auto-sync will never do it for you.
+`trail init` is idempotent and never clobbers your existing `.claude/settings.json`: it merges its blocks and leaves the rest alone. A `statusLine` that is not Trail-code's, in `~/.claude/settings.json` or the repo's own settings, is kept, and Trail-code adds its own only where you have none; re-running `init` refreshes Trail-code's own helper command if it is already installed. Pass `--no-statusline` (or `GRAFT_NO_STATUSLINE=1`) to skip installing one at all. Want the LLM summaries too? Run `trail build --deep` (with a key) whenever you like; auto-sync will never do it for you.
 
 ---
 
@@ -651,7 +655,8 @@ trail map --max-dirs N               # raise/lower the number of directories sho
 #   GRAFT_REFRESH=hash               # hash every file instead of trusting size+mtime
 
 # learnings
-trail note --title "<about>" [dir]   # save a decision: what this session decided, tried and ruled out (the text on stdin)
+trail note --title "<about>" [dir]   # save a learning: what this session decided, tried and ruled out (the text on stdin)
+trail note --always-follow           # mark it always follow: your agent won't go against it, even if asked
 trail note --personal                # about your own setup, not the code: keep it in ~/.trail, out of the repo
 trail check [dir]                    # check your branch's diff against the repo's learnings, yours and your skills (exit 1 on a conflict)
 trail check --base origin/main       # compare against this base instead of origin's default branch
@@ -677,7 +682,7 @@ trail init --list-agents             # list known agent ids and exit
 trail build [dir]                    # build the graft map in graft/: wiring graph + per-file cards (no LLM, no key)
 trail build --deep                   # add the LLM layer: concept nodes + per-symbol summary/crux (cached)
 trail build --check                  # build nothing: fail (exit 1) if graft/ has drifted from the code, for CI
-trail build --deep -e .ts .py        # with --deep: only summarize these extensions
+trail build -e .ts .py               # only index these extensions (also limits --deep summaries)
 trail build --no-reuse               # re-parse every file instead of replaying unchanged ones from cache
 trail build --follow-submodules      # include initialized submodules; persist the choice for builds + MCP refresh
 trail build --no-follow-submodules   # exclude submodules again and persist that choice (the default)
@@ -712,6 +717,9 @@ trail mcp [dir]                      # run the MCP server by hand
 trail --dir <path>                   # use a context dir other than <repo>/graft
 trail --version, -v                  # print the installed version and exit
 ```
+
+Extension selections also apply to automatic refreshes. Run an explicit
+`trail build` without `-e` to index all supported extensions again.
 
 Method calls resolve through the receiver's type, using constructor assignments
 (`self.router = APIRouter()`) and type annotations, not just the call-site

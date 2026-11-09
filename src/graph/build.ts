@@ -20,7 +20,8 @@ import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/no
 import { extractFile, languageLabelOf, languageOf, type Language, type RawEdge } from "./extract.js";
 import { extractGeneric, fallbackLangOf, genericLangOf, warmGenericGrammars, type GenericLang } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars, type ContainerLang } from "./container.js";
-import { missingNativePackages, nativeReady, type NativeFallback } from "./native.js";
+import { depthReady, missingDepthPackages, warmDepthGrammars } from "./depth-parser.js";
+import type { NativeFallback } from "./native.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
@@ -33,7 +34,7 @@ import {
 } from "./extract-cache.js";
 import { writeFingerprint } from "./fingerprint.js";
 import { seedGraph, type SeedResult } from "./seed.js";
-import { filterByOnlyDirs, listSourceStats } from "./source-files.js";
+import { filterByOnlyDirs, listSourceStats, normalizeExtensions } from "./source-files.js";
 import { resolveEdges, type GoModule } from "./resolve.js";
 import { enrichGraph, type EnrichStats } from "./enrich.js";
 import { readGraph, writeGraph, wiringPath } from "./write.js";
@@ -49,12 +50,12 @@ export { listSourceFiles } from "./source-files.js";
  * Which tier extracts a file. {@link buildGraph} and `checkGraph` both dispatch on
  * this, so a tier the build extracts can never be one the check can't see.
  *
- * Depth tier (hand-written, native grammar) when a language claims the file and its
- * native grammar loads. When it doesn't load (npm 12 skips the install script that
- * builds `tree-sitter-kotlin`), the file goes to that language's WASM stand-in in
- * the breadth tier and `fellBack` names the language. A container (.vue) is checked
- * before the breadth tier so a future grammar claiming its extension can't shadow
- * it; anything else goes to the breadth tier (generic tags.scm over a WASM grammar).
+ * Depth tier (hand-written extractor) when a language claims the file and its
+ * grammar loads (depth-parser.ts). When it doesn't load, the file goes to that
+ * language's stand-in in the breadth tier and `fellBack` names the language. A
+ * container (.vue) is checked before the breadth tier so a future grammar claiming
+ * its extension can't shadow it; anything else goes to the breadth tier (generic
+ * tags.scm over a WASM grammar).
  */
 export interface FileTier {
   lang: Language | null;
@@ -66,7 +67,7 @@ export interface FileTier {
 export function tierOf(path: string): FileTier {
   const depth = languageOf(path);
   if (depth) {
-    return nativeReady(depth)
+    return depthReady(depth)
       ? { lang: depth, container: null, generic: null, fellBack: null }
       : { lang: null, container: null, generic: fallbackLangOf(depth), fellBack: depth };
   }
@@ -76,18 +77,25 @@ export function tierOf(path: string): FileTier {
 }
 
 /** Load every WASM grammar these files need, before a synchronous parse loop can
- * call `extractGeneric`/`extractContainer`: the breadth tier's, the containers',
- * and the stand-ins for depth languages (a container's embedded one included)
- * whose native grammar didn't load. */
+ * call `extractFile`/`extractGeneric`/`extractContainer`: the depth tier's first
+ * (a container's embedded language included), then the breadth tier's, the
+ * containers', and the stand-ins for depth languages whose grammar didn't load. */
 export async function warmGrammarsFor(paths: Iterable<string>): Promise<void> {
+  const list = [...paths];
+  const depth = new Set<Language>();
+  for (const path of list) {
+    const lang = languageOf(path) ?? containerLangOf(path)?.inner;
+    if (lang) depth.add(lang);
+  }
+  await warmDepthGrammars(depth);
   const generic = new Set<string>();
   const containers = new Set<string>();
-  for (const path of paths) {
+  for (const path of list) {
     const t = tierOf(path);
     if (t.generic) generic.add(t.generic.name);
     if (t.container) {
       containers.add(t.container.name);
-      if (!nativeReady(t.container.inner)) generic.add(fallbackLangOf(t.container.inner).name);
+      if (!depthReady(t.container.inner)) generic.add(fallbackLangOf(t.container.inner).name);
     }
   }
   await warmGenericGrammars(generic);
@@ -120,6 +128,8 @@ function applyMinSubstanceGuard(scopes: ScopeV1[], nodes: NodeV1[]): ScopeV1[] {
 }
 
 export interface GraphBuildOptions {
+  /** Source extensions to include; absent or empty includes every supported language. */
+  extensions?: string[];
   /** Override the output dir (default: `<root>/.context`). */
   contextDir?: string;
   /** Replay unchanged files from the extraction cache instead of re-parsing them
@@ -169,7 +179,7 @@ export interface GraphBuildResult {
   byKind: Record<Kind, number>;
   byRelation: Record<Relation, number>;
   languages: string[];
-  /** Languages parsed by a WASM stand-in because their native grammar didn't load,
+  /** Languages parsed by a breadth stand-in because their depth grammar didn't load,
    * and the packages to allow at install to fix it. Absent when everything loaded. */
   nativeFallback?: NativeFallback;
   meaning: EnrichStats;
@@ -216,7 +226,8 @@ export async function buildGraph(
   });
   const onlyDirs = opts.onlyDirs && opts.onlyDirs.length > 0 ? new Set(opts.onlyDirs) : undefined;
   const repoFiles = filterByOnlyDirs(walked, root, onlyDirs);
-  const files = listSourceStats(root, outDir, repoFiles);
+  const extensions = normalizeExtensions(opts.extensions);
+  const files = listSourceStats(root, outDir, repoFiles, undefined, extensions);
   const discoveredScopes = discoverScopes(root, repoFiles);
 
   const nodes: NodeV1[] = [];
@@ -243,11 +254,10 @@ export async function buildGraph(
   let parsed = 0;
   let reused = 0;
 
-  // Breadth and container tiers: WASM grammars load asynchronously, so warm the
-  // ones this repo needs ONCE here (buildGraph is async) before the synchronous
-  // parse loop below can call extractGeneric/extractContainer. This is also where
-  // the depth tier's native grammars load, each on first ask, and where one that
-  // can't load gets its WASM stand-in warmed instead.
+  // Every tier's grammars are WASM and load asynchronously, so warm the ones this
+  // repo needs ONCE here (buildGraph is async) before the synchronous parse loop
+  // below can call extractFile/extractGeneric/extractContainer. A depth grammar
+  // that can't load gets its breadth stand-in warmed instead.
   await warmGrammarsFor(files.map((f) => f.abs));
   /** Languages whose files went to a stand-in: grammars for the fix, labels for people. */
   const fellBack = new Set<Language>();
@@ -259,7 +269,7 @@ export async function buildGraph(
     const { lang, container, generic, fellBack: standIn } = tierOf(f.abs);
     const label = languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
     // A .vue file's embedded script falls back the same way its language does.
-    const inner = container && !nativeReady(container.inner) ? container.inner : null;
+    const inner = container && !depthReady(container.inner) ? container.inner : null;
     if (standIn) {
       fellBack.add(standIn);
       fellBackLabels.add(label);
@@ -363,6 +373,7 @@ export async function buildGraph(
       nodeCount: nodes.length,
       edgeCount: edges.length,
       languages: [...langs].sort(),
+      extensions,
       scopes,
     },
     nodes,
@@ -417,7 +428,7 @@ export async function buildGraph(
   // these source bytes." Nothing about the projections below — which is why it is
   // safe to write here, and why `graphOnly` builds (the query path, which stops
   // right after this line) are still recorded as fresh.
-  writeFingerprint(outDir, entries, opts.onlyDirs);
+  writeFingerprint(outDir, entries, opts.onlyDirs, extensions);
 
   // Tier-2 passive surface: project the nodes into per-file markdown cards, and
   // refresh the INDEX roster. Pure projection — no LLM, no network.
@@ -464,7 +475,7 @@ export async function buildGraph(
     byRelation,
     languages: [...langs].sort(),
     ...(fellBack.size > 0
-      ? { nativeFallback: { languages: [...fellBackLabels].sort(), packages: missingNativePackages(fellBack) } }
+      ? { nativeFallback: { languages: [...fellBackLabels].sort(), packages: missingDepthPackages(fellBack) } }
       : {}),
     meaning,
     errors,

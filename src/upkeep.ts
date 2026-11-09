@@ -137,6 +137,7 @@ export function maybeRefreshInBackground(
   const cache = readUpdateCache(home);
   if (!needsRefresh(cache, now)) return false;
   writeUpdateCache({ latest: cache?.latest ?? null, checkedAt: now }, home);
+  if (readUpdateCache(home)?.checkedAt !== now) return false;
   try {
     const child = spawn(process.execPath, [graftCliPath(), '_update-check'], {
       detached: true,
@@ -181,6 +182,8 @@ export interface WiringOpts {
   hooks: boolean;
   /** false → skip Claude Code statusLine (`--no-statusline` / GRAFT_NO_STATUSLINE). */
   statusline: boolean;
+  /** `--agents auto`: the only hosts that write outside the repo (the agents installed when it ran). Absent → every wired host. */
+  laptop?: string[];
 }
 
 export const DEFAULT_WIRING_OPTS: WiringOpts = { global: true, mcp: true, hooks: true, statusline: true };

@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { underGraft, main, lastFileScopeHint, promptAskTimeout } from '../src/claude/hooks.js';
 import { readStats, readSession } from '../src/claude/state.js';
 import { runSync } from '../src/claude/sync-run.js';
+import { buildGraph } from '../src/graph/build.js';
+import { fingerprintPath } from '../src/graph/fingerprint.js';
+import { writeWorkspace } from '../src/graph/workspace.js';
 import { savingsLine } from '../src/context/savings.js';
 import { CI_ENV_VARS } from '../src/telemetry/gate.js';
 import { writeStats, emptyStats, acquireLock, resolveContextDir } from '../src/claude/state.js';
@@ -97,7 +100,9 @@ test('runSync clears dirty/syncing, recomputes stats, releases lock', () => {
     JSON.stringify({ meta: { nodeCount: 2, edgeCount: 1, languages: ['typescript'] },
       nodes: [{ id: 'a', summary_state: 'ready' }, { id: 'b', summary_state: 'pending' }],
       edges: [{ from: 'a', to: 'b' }] }));
-  runSync(d, fakeBuild);
+  let owner: unknown;
+  runSync(d, (dir) => { owner = JSON.parse(readFileSync(join(dir, 'graft', '.cache', '.sync.lock'), 'utf8')).pid; fakeBuild(dir); });
+  assert.equal(owner, process.pid, 'the lock names the process running the build, not the one that took it');
   const s = readStats(d)!;
   assert.equal(s.dirty, false);
   assert.equal(s.syncing, false);
@@ -133,6 +138,29 @@ test("runSync's default build passes --dir <resolved> to graft build when GRAFT_
   }
 });
 
+test("runSync's default build retains extension selection after an extractor change", async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-sync-extensions-'));
+  const argsFile = join(d, 'args-seen.json');
+  const stub = join(d, 'build-stub.cjs');
+  writeFileSync(stub, `require('fs').writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));`);
+  process.env.GRAFT_TEST_CLI = stub;
+  process.env.GRAFT_DIR = 'elsewhere';
+  try {
+    await buildGraph(d, { contextDir: resolveContextDir(d), extensions: ['.go', '.rs'] });
+    const fpPath = fingerprintPath(resolveContextDir(d));
+    const fp = JSON.parse(readFileSync(fpPath, 'utf8'));
+    fp.extractor = 'prior-extractor';
+    writeFileSync(fpPath, JSON.stringify(fp));
+    runSync(d);
+    assert.deepEqual(JSON.parse(readFileSync(argsFile, 'utf8')), [
+      'build', '.', '--dir', resolveContextDir(d), '--extensions', '.go', '.rs',
+    ]);
+  } finally {
+    delete process.env.GRAFT_TEST_CLI;
+    delete process.env.GRAFT_DIR;
+  }
+});
+
 test('runSync clears syncing even if build throws (money-safe failure)', () => {
   const d = mkdtempSync(join(tmpdir(), 'graft-sync-'));
   writeStats(d, { ...emptyStats(), dirty: true, syncing: true });
@@ -154,6 +182,27 @@ test('runSync stays dirty when build succeeds but wiring is unreadable', () => {
   assert.equal(s.dirty, true, 'unreadable wiring → stay dirty, retry next turn');
   assert.equal(s.syncedAt, null, 'not marked synced');
   assert.equal(acquireLock(d), true, 'lock released');
+});
+
+test('runSync clears dirty after a workspace sync writes workspace.json', () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-sync-workspace-'));
+  for (const child of ['api', 'web']) mkdirSync(join(d, child, '.git'), { recursive: true });
+  writeWorkspace(d, { version: 1, children: ['api', 'web'] }, resolveContextDir(d));
+  const stub = join(d, 'build-stub.cjs');
+  writeFileSync(stub, '');
+  writeStats(d, { ...emptyStats(), dirty: true, syncing: true, staleCount: 2 });
+  acquireLock(d);
+  process.env.GRAFT_TEST_CLI = stub;
+  try {
+    runSync(d);
+    const s = readStats(d)!;
+    assert.equal(s.dirty, false, 'a workspace parent has no wiring.json; workspace.json is its index');
+    assert.equal(s.syncing, false);
+    assert.ok(s.syncedAt);
+    assert.equal(acquireLock(d), true, 'lock released');
+  } finally {
+    delete process.env.GRAFT_TEST_CLI;
+  }
 });
 
 // ── lastFileScopeHint (the "you're working in backend/, weight it" hint) ──
@@ -332,6 +381,32 @@ test('prompt hook omits --in on a single-scope repo even with lastFile set', asy
     );
     const argsSeen: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
     assert.equal(argsSeen.indexOf('--in'), -1, 'single-scope repo: no --in narrowing');
+  } finally {
+    delete process.env.GRAFT_TEST_CLI;
+    delete process.env.CLAUDE_PROJECT_DIR;
+  }
+});
+
+test("prompt hook's graft child never waits for a repo's first build", async () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-prompt-wait-'));
+  mkdirSync(join(d, 'graft', '.graph'), { recursive: true });
+  writeFileSync(join(d, 'graft', '.graph', 'wiring.json'),
+    JSON.stringify({ meta: { nodeCount: 0, edgeCount: 0, languages: [] }, nodes: [], edges: [] }));
+  const stub = join(d, 'env-stub.cjs');
+  const seen = join(d, 'wait-seen.txt');
+  writeFileSync(
+    stub,
+    `require('fs').writeFileSync(${JSON.stringify(seen)}, String(process.env.GRAFT_FIRST_BUILD_WAIT_MS));\n` +
+      `process.stdout.write(JSON.stringify({ query: '', mode: 'lexical', hits: [], coverage: 1 }));\n`,
+  );
+  process.env.CLAUDE_PROJECT_DIR = d;
+  process.env.GRAFT_TEST_CLI = stub;
+  try {
+    await runWithStdin(
+      JSON.stringify({ session_id: 'p-wait', prompt: 'how does auth work here' }),
+      () => main('prompt'),
+    );
+    assert.equal(readFileSync(seen, 'utf8'), '0', 'it starts the build and answers within the hook budget');
   } finally {
     delete process.env.GRAFT_TEST_CLI;
     delete process.env.CLAUDE_PROJECT_DIR;

@@ -15,7 +15,9 @@ import { homedir } from 'node:os';
 import { brand, tag } from '../brand.js';
 import { scopeOf, scopesOfGraph } from '../graph/scopes.js';
 import { keepsNotes } from '../notes/home.js';
+import { hookNotice, linkedNews } from '../cloud/nudge.js';
 import { findNotes, listNotes, type NoteHit } from '../notes/notes.js';
+import { markStale } from '../notes/stale.js';
 import { INJECTED_POINTERS_CAP, notesForPrompt, relevantRetrieval, type AskJson } from './format.js';
 import { CHILD_TIMEOUT_MS, emitHook, graftJsonWithin, payloadSessionId, withContextDirArg } from './hook-io.js';
 import { promptPart } from './skills-wiring.js';
@@ -263,7 +265,10 @@ export async function handlePrompt(input: any, dir: string, opts: { budgetMs?: n
   recordSkillUse(skillOfPrompt(input?.prompt), input, dir);
   const skills = await promptPart(input, dir);
   if (skills.block) return void emitHook('UserPromptSubmit', { block: skills.block });
-  const say = (txt: string) => emitHook('UserPromptSubmit', { context: [skills.context, txt].filter(Boolean).join('\n\n'), notice: skills.notice });
+  // That this machine just connected reaches the person on the next prompt, whatever it is.
+  const news = linkedNews();
+  const say = (txt: string, offer?: string | null) =>
+    emitHook('UserPromptSubmit', { context: [skills.context, txt].filter(Boolean).join('\n\n'), notice: [skills.notice, news ?? offer].filter(Boolean).join('\n') || undefined });
   const prompt = promptWords(input?.prompt);
   if (prompt.length < MIN_CUE_CHARS) return say('');
   const underTrail = brand() === 'trail';
@@ -279,6 +284,7 @@ export async function handlePrompt(input: any, dir: string, opts: { budgetMs?: n
   const said = new Set(skills.said ?? []);
   const all = underTrail ? promptLearnings(dir, prompt, ask, byWords) : [];
   const learnings = all.filter((h) => !said.has(h.note.id));
+  markStale(learnings.map((h) => h.note), dir);
   // The session's one shown list, which on-touch reads too: a learning the block said is not shown again on a file open.
   if (said.size) s.injectedNotes = [...(s.injectedNotes ?? []), ...saidPaths(dir, said)].slice(-INJECTED_POINTERS_CAP);
   const notes = learnings.length ? notesForPrompt({ query: prompt, mode: 'learnings', hits: [], notes: learnings }, s) : null;
@@ -286,7 +292,9 @@ export async function handlePrompt(input: any, dir: string, opts: { budgetMs?: n
   // A count, never the prompt: nothing the person typed is kept (spec section 6).
   if (ask) s.promptAsks = (s.promptAsks ?? 0) + 1;
   // Teammates' branches on the same code come after an edit instead (hooks.ts editOverlap).
-  say([notes, retrieval].filter(Boolean).join('\n\n'));
+  // A teammate's learning just reached the agent: the moment the person gets the workspace link.
+  const offer = notes ? hookNotice(dir, "Claude just got your team's learnings for this", { session: id }) : null;
+  say([notes, retrieval].filter(Boolean).join('\n\n'), offer);
   if (ask || notes || said.size) writeSession(dir, id, s);
 }
 
