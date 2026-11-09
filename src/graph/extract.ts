@@ -594,7 +594,10 @@ function walk(node: SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEdge[], m
     const javaTypeDecl = ctx.lang === "java" && JAVA_TYPE_KINDS.has(desc.kind);
     const kotlinTypeDecl = ctx.lang === "kotlin" && KOTLIN_TYPE_KINDS.has(desc.kind);
     const swiftTypeDecl = ctx.lang === "swift" && SWIFT_TYPE_KINDS.has(desc.kind);
-    if (desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl)
+    // A TS interface's `extends A, B` is heritage too: it is what lets a call on a
+    // `LockingStore` find `save` declared on the `Store` it extends.
+    const tsInterfaceDecl = (ctx.lang === "typescript" || ctx.lang === "tsx") && desc.kind === "interface";
+    if (desc.kind === "class" || javaTypeDecl || kotlinTypeDecl || swiftTypeDecl || tsInterfaceDecl)
       edges.push(...heritageEdges(node, id, ctx));
     if (ctx.lang === "php") edges.push(...phpAttributeReferenceEdges(node, id, ctx));
     if (ctx.lang === "java") edges.push(...javaAnnotationReferenceEdges(node, id, ctx));
@@ -1116,6 +1119,23 @@ function describe(node: SyntaxNode, ctx: WalkCtx): DefDescriptor | null {
     };
   }
 
+  // TS: a method signature in a NAMED interface is a method owned by that interface,
+  // so a call through an interface-typed receiver (`store: Store` → `store.save()`)
+  // has a node to land on — the TS twin of Go's `method_elem` (#687). Signatures in
+  // anonymous object types (`type T = { m(): void }`, `(x: { m(): void })`) have no
+  // name to own them and mint nothing.
+  if ((ctx.lang === "typescript" || ctx.lang === "tsx") && node.type === "method_signature") {
+    const owner = tsInterfaceName(node);
+    const nameNode = node.childForFieldName("name");
+    // A computed (`[Symbol.iterator]()`) or string-literal name is not a name a member
+    // call can spell; skip it rather than mint a node under its source text.
+    if (!owner || nameNode?.type !== "property_identifier") return null;
+    // An overload set is one method: mint its first signature only. Two nodes for
+    // `Store.get` would make every call to it ambiguous, and resolveTypedMember drops those.
+    if (isRepeatedTsSignature(node, nameNode.text)) return null;
+    return { name: nameNode.text, kind: "method", headerEnd: node.endIndex, hashNode: node, owner };
+  }
+
   const mapped = ctx.kinds[node.type];
   if (mapped) {
     const name = node.childForFieldName("name")?.text;
@@ -1177,6 +1197,13 @@ function describeGo(node: SyntaxNode, _ctx: WalkCtx): DefDescriptor | null {
       headerEnd: body ? body.startIndex : node.endIndex,
       hashNode: node,
     };
+  }
+
+  if (node.type === "method_elem") {
+    const name = node.childForFieldName("name")?.text;
+    const owner = goInterfaceName(node);
+    if (!name || !owner) return null;
+    return { name, kind: "method", headerEnd: node.endIndex, hashNode: node, owner };
   }
 
   // `type Name <shape>` — one type_spec per name (grouped `type ( … )` yields several).
@@ -1942,6 +1969,31 @@ function goReceiverType(node: SyntaxNode): string | null {
   return type?.type === "type_identifier" ? type.text : null;
 }
 
+function goInterfaceName(node: SyntaxNode): string | null {
+  const spec = node.parent?.parent;
+  return spec?.type === "type_spec" ? (spec.childForFieldName("name")?.text ?? null) : null;
+}
+
+/** The interface a TS `method_signature` belongs to, or null when it sits in an
+ * anonymous object type (`object_type`) or anywhere else that is not a named
+ * `interface_declaration`'s own body. */
+function tsInterfaceName(node: SyntaxNode): string | null {
+  const body = node.parent;
+  const decl = body?.parent;
+  if (body?.type !== "interface_body" || decl?.type !== "interface_declaration") return null;
+  return decl.childForFieldName("name")?.text ?? null;
+}
+
+/** Whether an earlier signature in the same interface body already declares `name`
+ * (a TS overload set: `get(id: string): T; get(id: number): T;`). */
+function isRepeatedTsSignature(node: SyntaxNode, name: string): boolean {
+  for (const sib of node.parent?.namedChildren ?? []) {
+    if (sib.startIndex >= node.startIndex) return false;
+    if (sib.type === "method_signature" && sib.childForFieldName("name")?.text === name) return true;
+  }
+  return false;
+}
+
 /** Go visibility: a symbol is exported iff its own name starts with an uppercase
  * letter. For a receiver-qualified method name, the own name is the part after the dot. */
 function goExported(name: string): boolean {
@@ -2085,6 +2137,16 @@ function heritageEdges(node: SyntaxNode, classId: string, ctx: WalkCtx): RawEdge
     }
     return edges;
   }
+  // `interface A extends B<T>, ns.C` — the clause is a direct child of the
+  // declaration (a class wraps its clauses in `class_heritage` instead).
+  if (node.type === "interface_declaration") {
+    const clause = node.namedChildren.find((c) => c.type === "extends_type_clause");
+    for (const t of clause?.namedChildren ?? []) {
+      const name = tsSupertypeName(t);
+      if (name) edges.push({ source: classId, relation: "extends", name, file: ctx.rel });
+    }
+    return edges;
+  }
   const heritage = node.namedChildren.find((c) => c.type === "class_heritage");
   for (const clause of heritage?.namedChildren ?? []) {
     const relation: Relation | null =
@@ -2095,12 +2157,38 @@ function heritageEdges(node: SyntaxNode, classId: string, ctx: WalkCtx): RawEdge
           : null;
     if (!relation) continue;
     for (const t of clause.namedChildren) {
-      if (t.type === "identifier" || t.type === "type_identifier") {
-        edges.push({ source: classId, relation, name: t.text, file: ctx.rel });
-      }
+      const name = tsSupertypeName(t);
+      if (name) edges.push({ source: classId, relation, name, file: ctx.rel });
     }
   }
   return edges;
+}
+
+/**
+ * The bare name a TS/JS heritage entry refers to, with generic arguments and
+ * namespace qualification erased: `Router<T>` → `Router`, `ns.Base` → `Base`.
+ *
+ * Taking only a direct `identifier` child misses every generic supertype,
+ * because `implements Router<T>` puts a `generic_type` there instead — measured
+ * on honojs/hono, that left the whole repo with 2 `implements` edges and none
+ * of the five routers connected to the `Router` interface they implement.
+ */
+function tsSupertypeName(node: SyntaxNode): string | null {
+  if (node.type === "identifier" || node.type === "type_identifier") return node.text;
+  if (node.type === "generic_type") {
+    const head = node.namedChildren.find(
+      (c) => c.type === "type_identifier" || c.type === "nested_type_identifier" || c.type === "identifier",
+    );
+    return head ? tsSupertypeName(head) : null;
+  }
+  // `ns.Base` — the last segment is the type itself.
+  if (node.type === "nested_type_identifier" || node.type === "member_expression") {
+    const ids = node.namedChildren.filter(
+      (c) => c.type === "type_identifier" || c.type === "identifier" || c.type === "property_identifier",
+    );
+    return ids.length ? ids[ids.length - 1].text : null;
+  }
+  return null;
 }
 
 /**
@@ -2252,8 +2340,7 @@ if (lang === "kotlin") {
   if (lang === "go" && fn.type === "selector_expression") {
     // `pkg.Fn()` / `recv.Method()` — the called name is the trailing field.
     const p = fn.childForFieldName("field") ?? fn.namedChildren.at(-1);
-    const operand = fn.childForFieldName("operand");
-    const receiver = operand?.type === "identifier" ? operand.text : undefined;
+    const receiver = goReceiver(fn.childForFieldName("operand"));
     return p ? { name: p.text, viaMember: true, receiver } : null;
   }
   if ((lang === "typescript" || lang === "tsx") && fn.type === "member_expression") {
@@ -2423,6 +2510,14 @@ function phpScopeReceiver(scope: SyntaxNode | null): string | undefined {
   return undefined;
 }
 
+function goReceiver(operand: SyntaxNode | null): string | undefined {
+  if (operand?.type === "identifier") return operand.text;
+  if (operand?.type !== "selector_expression") return undefined;
+  const head = operand.childForFieldName("operand");
+  const field = operand.childForFieldName("field");
+  return head?.type === "identifier" && field ? `${head.text}.${field.text}` : undefined;
+}
+
 /** ts `member_expression` node's receiver text: `this`, `this.x`, or a bare identifier. */
 function tsReceiver(fn: SyntaxNode): string | undefined {
   const obj = fn.childForFieldName("object");
@@ -2458,6 +2553,13 @@ if (lang === "kotlin") return node.type === "import_header";
   // PHP: one edge per imported symbol — the clause leaf inside a (possibly
   // grouped) `use A\B, C\D;` / `use A\{B, C};` declaration.
   if (lang === "php") return node.type === "namespace_use_clause";
+  // A re-export (`export { X } from "./x"`, `export * from "./x"`) is an import
+  // edge wearing an export's clothes: a barrel file defines nothing, so without
+  // this its node has no outgoing edges and a traversal arriving there stops
+  // dead, never reaching the module that holds the code. Only the `from` form
+  // qualifies — a plain `export const x = 1` has no source and must keep
+  // descending, or the definitions inside it are lost.
+  if (node.type === "export_statement") return node.childForFieldName("source") !== null;
   return node.type === "import_statement" || node.type === "import_from_statement";
 }
 
@@ -2508,8 +2610,11 @@ function importSpecifier(node: SyntaxNode, lang: Language): string | null {
     // frameworks stay as unresolved (but truthful) import intents.
     return node.namedChildren.find((c) => c.type === "identifier")?.text ?? null;
   }
-  const str = node.namedChildren.find((c) => c.type === "string");
-  if (!str) return null;
+  // `source` is the module string on both an import_statement and a re-export's
+  // export_statement; fall back to the first string child for grammars that do
+  // not name the field.
+  const str = node.childForFieldName("source") ?? node.namedChildren.find((c) => c.type === "string");
+  if (!str || str.type !== "string") return null;
   const frag = str.namedChildren.find((c) => c.type === "string_fragment");
   return frag?.text ?? str.text.replace(/^['"]|['"]$/g, "");
 }
