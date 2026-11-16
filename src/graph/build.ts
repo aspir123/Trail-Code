@@ -183,6 +183,9 @@ export interface GraphBuildResult {
    * and the packages to allow at install to fix it. Absent when everything loaded. */
   nativeFallback?: NativeFallback;
   meaning: EnrichStats;
+  /** Recoverable Tier-1/build-output errors. These leave a partial graph on
+   * disk, but the CLI must not report the build as successful. */
+  structuralErrors: number;
   errors: string[];
 }
 
@@ -313,14 +316,19 @@ export async function buildGraph(
     }
 
     const hash = contentHash(source);
-    if (cached && hash === cached.hash && cached.via === via) {
+    // A cached `error` is not a parse result, it is the absence of one — and the
+    // absence need not be the file's fault. A wasm grammar that aborts because the
+    // run before it exhausted the heap fails whichever file happened to be in
+    // flight, so that error belongs to the *run*, not to the bytes this entry is
+    // keyed on. Replaying it pins the accident to the content hash: an untouched
+    // file stays broken on every later build, and a whole language can vanish from
+    // a graph that still exits 0 (#312). So an entry carrying an error falls
+    // through and is re-parsed — it produced no nodes, which is exactly what makes
+    // re-parsing it affordable, and a run that now succeeds repairs the entry.
+    if (cached && hash === cached.hash && cached.via === via && !cached.error) {
       entries[rel] = { ...cached, size: f.size, mtimeMs: f.mtimeMs };
       sources.set(rel, source);
       reused++;
-      if (cached.error) {
-        errors.push(cached.error); // this file failed to parse last time too
-        return;
-      }
       nodes.push(...cached.nodes);
       rawEdges.push(...cached.rawEdges);
       langs.add(label);
@@ -403,7 +411,7 @@ export async function buildGraph(
     const { enrichWithLsp } = await import("./lsp/enrich.js");
     const r = await enrichWithLsp(graph, root);
     graph.meta.edgeCount = graph.edges.length;
-    opts.onProgress?.({ phase: "enrich", index: r.added, total: r.queried, file: `lsp:${r.server ?? "none"}` });
+    opts.onProgress?.({ phase: "enrich", index: r.added, total: r.queried, file: `lsp:${r.servers.join(", ") || "none"}` });
   }
 
   const graphPath = writeGraph(graph, outDir);
@@ -478,6 +486,7 @@ export async function buildGraph(
       ? { nativeFallback: { languages: [...fellBackLabels].sort(), packages: missingDepthPackages(fellBack) } }
       : {}),
     meaning,
+    structuralErrors: errors.length - meaning.errors.length,
     errors,
   };
 }

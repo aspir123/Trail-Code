@@ -17,7 +17,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { matter } from "../util/front-matter.js";
 import { contextDirFor } from "../context/node-file.js";
-import { withSavings, savingsFor, savingsTurnNudge, type Savings } from "../context/savings.js";
+import { withSavings, savingsFor, savingsTurnNudge, groupDigits, type Savings } from "../context/savings.js";
 import { loadGraphCached, loadAskIndexCached } from "../graph/load.js";
 import {
   assertPrefixIndexed,
@@ -309,9 +309,12 @@ const OUTGOING_RELS: Relation[] = ["calls", "references", "imports", "implements
 
 /** Split a prose query into word-like tokens, keeping dots so a qualified name
  * ("Cache.get") or package-qualified name ("pkg.Fn") survives as one token —
- * `resolveSymbol`'s own suffix/last-segment matching handles the rest. */
+ * `resolveSymbol`'s own suffix/last-segment matching handles the rest.
+ * The separator is Unicode-aware (#432): an ASCII-only class silently dropped
+ * every non-Latin script, so a query that named a CJK symbol — or merely mixed
+ * scripts — lost its words before they could be tried. */
 function subjectWords(query: string): string[] {
-  return [...new Set(query.split(/[^A-Za-z0-9_.]+/).filter(Boolean))];
+  return [...new Set(query.split(/[^\p{L}\p{N}._]+/u).filter(Boolean))];
 }
 
 /** Resolve the query's structural subject via {@link resolveSymbol}, trying
@@ -1595,9 +1598,9 @@ function askSavingsLine(r: AskResult, body: string): string {
   const base = toTokens(r.saved.baselineChars);
   const pct = Math.round((saved / base) * 100);
   return (
-    `${tag()} tokens saved ≈ ${saved.toLocaleString()} (${pct}%) — this pack ≈ ` +
-    `${pack.toLocaleString()} tok vs reading the ${r.saved.files} source file(s) whole ≈ ` +
-    `${base.toLocaleString()} tok. Estimate (baseline = those files read in full).` +
+    `${tag()} tokens saved ≈ ${groupDigits(saved)} (${pct}%) — this pack ≈ ` +
+    `${groupDigits(pack)} tok vs reading the ${r.saved.files} source file(s) whole ≈ ` +
+    `${groupDigits(base)} tok. Estimate (baseline = those files read in full).` +
     savingsTurnNudge(saved)
   );
 }

@@ -59,6 +59,7 @@ import { createHash } from "node:crypto";
 import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, readPackageName, runUpgrade } from "./cli-meta.js";
 import { nativeFallbackNotice } from "./graph/native.js";
 import { lockHeldByOther, patchBuildConfig, type BuildConfig } from "./util/state.js";
+import { NEVER_INCLUDE_DIRS } from "./ingest/fs.js";
 import { normalizePathPrefix } from "./util/paths.js";
 import { latestSession, formatSessionStats, sessionInputRate } from "./claude/session-metrics.js";
 import { listSessionIds, readSession, sessionDir } from "./claude/state.js";
@@ -202,6 +203,12 @@ program
   .option("--dir <path>", "context graph directory (default: <repo>/graft)")
   .option("--provider <name>", "LLM wire format: openai | anthropic | litellm | orcarouter (env GRAFT_PROVIDER)")
   .option("--model <id>", "model id for the LLM pass (env GRAFT_MODEL)")
+  .option(
+    "--synth-model <id>",
+    "model id for the --deep concept-synthesis pass alone (env GRAFT_SYNTH_MODEL; default: the --model id). " +
+      "A fast non-reasoning model here writes the concept nodes while per-file summaries keep the main model; " +
+      "a build's synthesis cache is keyed by this model, so switching it re-synthesizes",
+  )
   .option("--api-key <key>", "provider API key (env GRAFT_API_KEY)")
   .option("--base-url <url>", "OpenAI-compatible endpoint URL (env GRAFT_BASE_URL)");
 
@@ -209,6 +216,7 @@ interface GlobalOpts {
   dir?: string;
   provider?: string;
   model?: string;
+  synthModel?: string;
   apiKey?: string;
   baseUrl?: string;
 }
@@ -220,6 +228,7 @@ function cliConfig(): EngineConfig {
     contextDir: o.dir,
     provider: o.provider as ProviderKind | undefined,
     model: o.model,
+    synthModel: o.synthModel,
     apiKey: o.apiKey,
     baseUrl: o.baseUrl,
   };
@@ -307,9 +316,9 @@ function parseTabs(raw: string | undefined): VizTab[] | undefined {
 /**
  * Commands that own the upgrade story themselves (`version`, `upgrade`) or must
  * not editorialize on stderr at startup (`mcp` runs its own upkeep at boot, and
- * `_update-check` IS the fetch).
+ * internal helpers must not schedule another copy of themselves).
  */
-const UPKEEP_SKIP = new Set(["version", "upgrade", "_update-check", "mcp"]);
+const UPKEEP_SKIP = new Set(["version", "upgrade", "_update-check", "_telemetry-flush", "mcp"]);
 
 /**
  * Every other command: top up the cached registry answer in the background and,
@@ -520,9 +529,18 @@ grouped(program.command("build"), GROUP.setup)
     "concept synthesis batches in flight at once during --deep (default 4). Separate from -j: " +
       "each synthesis call carries a whole batch of summaries, not one file",
   )
+  .option(
+    "--synth-batch-chars <n>",
+    "char budget of summary text per concept-synthesis call during --deep (default 48000). " +
+      "Lower it to trade fewer larger calls for more, smaller, parallel ones — worth it only " +
+      "when --synth-concurrency already exceeds the batch count. A budget low enough to " +
+      "overflow the batch an edit lands in splits its neighbour too, so that edit " +
+      "re-synthesizes two batches instead of one",
+  )
   .option("--no-reuse", "re-parse every file instead of replaying unchanged ones from the extraction cache")
   .option("--lsp", "add compiler-grade call edges via a language server if one is installed (opt-in, slower; e.g. rust-analyzer, clangd)")
   .option("--allow-partial", "with --deep: exit 0 even when some files' summaries failed (default: a degraded meaning tier exits 1)")
+  .option("--strict", "fail with exit code 1 if any structural parsing or extraction errors occur")
   .option(
     "--follow-submodules",
     "include initialized Git submodules recursively; persisted for later builds and automatic refreshes",
@@ -542,8 +560,9 @@ grouped(program.command("build"), GROUP.setup)
   )
   .option(
     "--include-dir <name>",
-    "override SKIP_DIRS for this repo's walks, repeatable (e.g. --include-dir build --include-dir tools); " +
-      "persisted, so a later build (and the hooks/refresh path) include it without the flag; dot-dirs are never overridable",
+    "override SKIP_DIRS (and named hidden directories) for this repo's walks, repeatable " +
+      "(e.g. --include-dir build --include-dir .kb); persisted, so a later build (and the " +
+      "hooks/refresh path) include it without the flag; .git, .trail and .graft are never overridable",
     (val: string, prev: string[]) => [...prev, val],
     [] as string[],
   )
@@ -568,7 +587,9 @@ grouped(program.command("build"), GROUP.setup)
       reuse?: boolean;
       lsp?: boolean;
       allowPartial?: boolean;
+      strict?: boolean;
       synthConcurrency?: string;
+      synthBatchChars?: string;
       includeDir?: string[];
       onlyDir?: string[];
       followSubmodules?: boolean;
@@ -598,20 +619,32 @@ grouped(program.command("build"), GROUP.setup)
       console.error(`✗ --synth-concurrency must be a number, got "${opts.synthConcurrency}"`);
       process.exit(1);
     }
+    // Validated RAW, before any flooring: `Math.max(1, …)` used to run first, so
+    // a budget of 0 or less was floored into a 1-char budget — one synthesis
+    // call per file, the per-file call storm the batch pass exists to prevent —
+    // and the guard below never saw the values it existed for.
+    let synthBatchChars: number | undefined;
+    if (opts.synthBatchChars !== undefined) {
+      const raw = Number(opts.synthBatchChars);
+      if (!Number.isFinite(raw) || raw < 1) {
+        console.error(`✗ --synth-batch-chars must be a positive number, got "${opts.synthBatchChars}"`);
+        process.exit(1);
+      }
+      synthBatchChars = Math.floor(raw);
+    }
     warnUnsupportedExtensions(opts.extensions);
     // Persisted BEFORE the build itself runs, so this invocation's walks (and
     // every later no-flag build / hooks refresh) see it identically — the
     // walkDir call sites read it from state, not from a threaded option.
     const buildConfigPatch: BuildConfig = {};
     if (opts.includeDir && opts.includeDir.length > 0) {
-      // --include-dir takes bare SKIP_DIRS-style directory NAMES (shouldSkipDir
-      // compares a single path segment), never paths, and dot-dirs are never
-      // overridable at all (see the option's own help text) — reject anything
-      // else up front instead of silently persisting a value that can never
-      // match a real directory name.
+      // --include-dir takes bare directory NAMES (shouldSkipDir compares a
+      // single path segment), never paths. Named hidden directories (.kb) are
+      // the same opt-in as SKIP_DIRS names; NEVER_INCLUDE_DIRS (.git, .trail,
+      // .graft) stay forbidden — reject those up front instead of persisting a no-op.
       for (const name of opts.includeDir) {
-        if (name.startsWith(".")) {
-          console.error(`✗ --include-dir "${name}": dot-directories are never overridable`);
+        if (NEVER_INCLUDE_DIRS.has(name)) {
+          console.error(`✗ --include-dir "${name}": ${name} is never overridable`);
           process.exit(1);
         }
         if (name.includes("/") || name.includes("\\")) {
@@ -684,7 +717,9 @@ grouped(program.command("build"), GROUP.setup)
         extensions: opts.extensions,
         concurrency,
         synthConcurrency,
+        synthBatchChars,
         childConfig: cliConfig(),
+        strict: opts.strict,
         override: buildGlobalDir,
         includeDirs: opts.includeDir,
         followSubmodules: followSubmodulesWasExplicit ? opts.followSubmodules : undefined,
@@ -701,7 +736,9 @@ grouped(program.command("build"), GROUP.setup)
       const c = await engine.init(dir, {
         extensions: opts.extensions,
         onlyDirs,
+        concurrency,
         synthConcurrency,
+        synthBatchChars,
         onProgress: ({ phase, index, total, file }) =>
           process.stderr.write(
             `\r${phase === "summarize" ? "reading" : "writing"} concepts ${index + 1}/${total}: ${file.slice(0, 40).padEnd(40)}`,
@@ -712,7 +749,9 @@ grouped(program.command("build"), GROUP.setup)
         throw err;
       });
       process.stderr.write("\n");
-      const conceptLine = `concepts: ${c.nodes} nodes, ${c.links} links from ${c.files} files (${c.summarized} read, ${c.cached} cached)`;
+      // Named only when it differs, so the common single-model build says nothing new.
+      const synthNote = resolved.synthModel !== resolved.model ? ` [synthesis: ${resolved.synthModel}]` : "";
+      const conceptLine = `concepts: ${c.nodes} nodes, ${c.links} links from ${c.files} files (${c.summarized} read, ${c.cached} cached)${synthNote}`;
       if (c.nodes === 0) console.error(`⚠ ${conceptLine}`);
       else console.log(`✓ ${conceptLine}`);
       for (const e of c.errors) console.error(`✗ ${e}`);
@@ -737,7 +776,16 @@ grouped(program.command("build"), GROUP.setup)
       throw err;
     });
     process.stderr.write("\n");
-    console.log(`✓ wiring: ${g.nodes} nodes (${fmt(g.byKind)}), ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}]`);
+    const structuralFailed = Boolean(opts.strict && g.structuralErrors > 0);
+    if (structuralFailed) {
+      console.error(
+        `✗ wiring incomplete: ${g.structuralErrors} structural error(s), ` +
+          `${g.nodes} nodes, ${g.edges} edges, ${g.cards} cards.`,
+      );
+      process.exitCode = 1;
+    } else {
+      console.log(`✓ wiring: ${g.nodes} nodes (${fmt(g.byKind)}), ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}]`);
+    }
     console.log(`  parsed: ${g.parsed} of ${g.files} files (${g.reused} replayed from cache)`);
     // Worth one line: this build started from a graph the user never built *here*.
     if (g.seededFrom) console.log(`  seeded: copied a starting graph from ${g.seededFrom} (git worktree)`);
@@ -748,18 +796,22 @@ grouped(program.command("build"), GROUP.setup)
     console.log(`  → ${g.contextDir}`);
     // The activation event. Everything here is a bucket or a fixed label: repo
     // scale rather than a file count, a language set rather than file names.
-    track(
-      "build_completed",
-      {
-        files_bucket: filesBucket(g.files),
-        langs: langsValue(g.languages),
-        mode: deep ? "deep" : "fast",
-        duration_bucket: durationBucket(Date.now() - buildStartedAt),
-        incremental: String(g.reused > 0),
-        overlap: String(overlap),
-      },
-      { repo: buildRoot },
-    );
+    if (structuralFailed) {
+      track("build_failed", { stage: "graph", code: errorCode(new Error(g.errors[0])) }, { repo: buildRoot });
+    } else {
+      track(
+        "build_completed",
+        {
+          files_bucket: filesBucket(g.files),
+          langs: langsValue(g.languages),
+          mode: deep ? "deep" : "fast",
+          duration_bucket: durationBucket(Date.now() - buildStartedAt),
+          incremental: String(g.reused > 0),
+          overlap: String(overlap),
+        },
+        { repo: buildRoot },
+      );
+    }
     for (const e of g.errors) console.error(`✗ ${e}`);
     // A language whose depth grammar didn't load was parsed by its breadth stand-in:
     // say which, and the install that fixes it. Nothing when everything loaded.
@@ -947,7 +999,9 @@ async function runCheckCommand(
       if (!g.missing) console.log("\n" + formatGraphCheckReport(g));
     }
 
-    if (bothMissing || markdownFail || wiringFail) process.exit(1);
+    // exitCode, not exit(): exit() drops whatever of the JSON is still queued for a
+    // pipe, and a stale graph's pendingIds alone can run to hundreds of KB.
+    if (bothMissing || markdownFail || wiringFail) process.exitCode = 1;
 }
 
 // Under trail this is part of `status`; the old name still runs, unlisted.
@@ -1242,7 +1296,7 @@ grouped(program.command("init"), GROUP.setup)
   )
   .argument("[dir]", "target repo directory", ".")
   .option("--no-build", "skip building the graph (wire files only)")
-  .option("--agents <ids...>", `only these agents (${hostIds().join(", ")}, claude), or auto: repo files for Claude Code, Cursor, Codex and OpenCode, plus files and laptop settings for the agents installed here`)
+  .option("--agents <ids...>", `wire only these; removes ${brand()}'s wiring for unlisted agents, including user-level files (unless --no-global); pass every agent you use (${hostIds().join(", ")}, claude), or auto: repo files for Claude Code, Cursor, Codex and OpenCode, plus files and laptop settings for the agents installed here`)
   .option("--all-agents", "write instruction files for every known agent, detected or not")
   .option("--no-agents", "Claude Code wiring only; skip other agents")
   .option("--list-agents", "list known agent ids and exit")
@@ -1253,7 +1307,7 @@ grouped(program.command("init"), GROUP.setup)
   .option("--just-me", "trail just for you here: git sees none of it, your learnings stay in ~/.trail, and nothing asks you to commit or share")
   .option("--team", "share trail with your team here: you commit .trail/ and .claude/settings.json once, and teammates' Claude reads your learnings")
   .option("-y, --yes", "skip the picker and wire every detected agent (the pre-0.8 default)")
-  .option("--no-global", "skip writes outside this repo (the ~/.codex/ config + hooks)")
+  .option("--no-global", "skip writes and removals outside this repo")
   .option("--verbose", "print every file written, the graph build's own output and the closing banner")
   .option(
     "--connect <code>",
@@ -1624,7 +1678,7 @@ async function runInitCommand(dir: string, opts: InitOptions, progress?: InitPro
     // guessing (pre-0.8 this silently wired every agent the machine had ever
     // installed — see --yes to get that back).
     const home = homedir();
-    const plan = planInit(repo, { home });
+    const plan = planInit(repo, { home, mcp: opts.mcp, hooks: opts.hooks, global: opts.global });
     const detectedIds = plan.filter((p) => p.detected).map((p) => p.id);
     const noAgents = (opts as { agents?: unknown }).agents === false;
 
@@ -1680,7 +1734,7 @@ async function runInitCommand(dir: string, opts: InitOptions, progress?: InitPro
         console.error(`· --agents auto: repo files for Claude Code, Cursor, Codex and OpenCode; laptop settings for ${autoSel.agents.length ? agentList(autoSel.agents) : "none (no agent found here)"}\n`);
       console.error(formatPlan(laptopOnly(plan, laptop), ids, repo, home));
       for (const child of children)
-        console.error(`\n· ${child}/ (workspace child)\n` + formatPlan(laptopOnly(planInit(join(repo, child), { home }), laptop), ids, join(repo, child), home));
+        console.error(`\n· ${child}/ (workspace child)\n` + formatPlan(laptopOnly(planInit(join(repo, child), { home, mcp: opts.mcp, hooks: opts.hooks, global: opts.global }), laptop), ids, join(repo, child), home));
       return null;
     }
     if (ids.length === 0) {
@@ -2268,7 +2322,12 @@ function wireTarget(
         if (trust) say(`⚠ ${trust}`);
       }
       // Only worth saying when there was actually something out-of-repo to skip.
-      if (opts.global === false && selectedWrites(plan, ids).some((w) => w.scope === "global"))
+      // `plan` already reflects --no-global, so ask the unsuppressed plan whether
+      // there was anything out-of-repo to skip.
+      if (
+        opts.global === false &&
+        selectedWrites(planInit(repo, { home, mcp: opts.mcp, hooks: opts.hooks }), ids).some((w) => w.scope === "global")
+      )
         say("· skipped out-of-repo writes (--no-global)");
     }
 
