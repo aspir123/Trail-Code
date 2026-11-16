@@ -138,13 +138,13 @@ export function gateNote(input: GateInput, existing: Note[]): GateResult {
 
   for (const line of text.split(/\r?\n/)) {
     if (STATUS.some((re) => re.test(line))) {
-      problems.push(`"${clip(line)}" is status: true today, wrong next week. Keep what stays true (the cause, the rule, the why) and put status in the PR.`);
+      problems.push(`"${clip(line)}" is status: true today, wrong next week. Keep what stays true (the cause, the choice, the why) and put status in the PR.`);
       break;
     }
   }
 
   if (!input.personal && !decisionLines(input.body).some((l) => WHY.test(l))) {
-    problems.push('No line says why. Give each decision its reason: the cause, the error it hit, or the number that settled it ("because…", "otherwise…", "fails with…").');
+    problems.push('No line says why. Give each choice its reason: the cause, the error it hit, or the number that settled it ("because…", "otherwise…", "fails with…").');
   }
 
   const twin = repeatOf(input, existing);
@@ -188,6 +188,7 @@ export function namesRepoSymbol(repo: string, names: string[]): boolean {
       execFileSync("git", ["grep", "-q", "-w", "-F", "-e", name, "--", ".", ":(exclude).trail", ":(exclude).claude", ":(exclude)*.md"], {
         cwd: repo,
         stdio: "ignore",
+        windowsHide: true,
       });
       return true;
     } catch {
@@ -206,7 +207,7 @@ export function namesRepoSymbol(repo: string, names: string[]): boolean {
 export function trackedFiles(repo: string, files: string[]): Set<string> {
   if (!files.length) return new Set();
   try {
-    const out = execFileSync("git", ["ls-files", "-z", "--", ...files], { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const out = execFileSync("git", ["ls-files", "-z", "--", ...files], { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     return new Set(out.split("\0").filter(Boolean));
   } catch {
     return new Set(files.filter((f) => existsSync(join(repo, f))));
